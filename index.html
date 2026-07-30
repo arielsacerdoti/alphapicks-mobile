@@ -660,6 +660,22 @@
     }
   }
 
+  // Best-effort report of every time FMP got used as a Yahoo-miss backup, so real-world call
+  // volume after the Yahoo-primary/FMP-backup change (2026-07-30) can be measured instead of
+  // estimated -- see Write-FmpUsage / fmp_usage.log in schwab_server.ps1. Only fires when a
+  // desktop server is actually reachable (HOME_MODE); away mode has nowhere to log to. Never
+  // awaited, never blocks or affects the caller's own price fetch.
+  function logFmpUsage(symbols, context) {
+    if (!symbols || !symbols.length || !HOME_MODE) return;
+    try {
+      fetch(`${HOME_SERVER}/fmp-usage-log`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ symbols, context }),
+      }).catch(() => {});
+    } catch (_) {}
+  }
+
   let rows, tickers, divCache = {};
 
   function dbg() {} // no-op
@@ -2219,16 +2235,6 @@
     } catch { return null; }
   }
 
-  async function fetchFMPExtended(symbol) {
-    try {
-      const resp = await fetch(`https://financialmodelingprep.com/stable/aftermarket-trade?symbol=${symbol}&apikey=${FMP_KEY}`, { cache: 'no-store' });
-      if (!resp.ok) return null;
-      const data = await resp.json();
-      const q = data?.[0];
-      return (q && q.price != null) ? q : null;
-    } catch { return null; }
-  }
-
   function normaliseFMP(quote, extTrade, session) {
     const isPre  = session === 'PRE';
     const isPost = session === 'POST';
@@ -2261,33 +2267,34 @@
     const chipLabel = document.getElementById('spy-chip-label');
     const session   = getSessionFromClock();
 
-    // ── During REGULAR session: use SPY live price ────────────────────────
+    // ── During REGULAR session: use SPY live price (Yahoo primary, FMP backup) ──
     if (session === 'REGULAR') {
       if (chipLabel) chipLabel.textContent = 'S&P 500';
+      const yUrl = `https://query1.finance.yahoo.com/v8/finance/chart/SPY?interval=1d&range=5d&formatted=false&_cb=${Date.now()}`;
+      const data = await fetchJSON(yUrl);
+      const res  = data?.chart?.result?.[0];
+      const price = res?.meta?.regularMarketPrice;
+      // Use regularMarketPreviousClose first; fall back to last completed daily candle
+      let prev = res?.meta?.regularMarketPreviousClose ?? null;
+      if (!prev) {
+        const ts = res?.timestamp ?? [], cs = res?.indicators?.quote?.[0]?.close ?? [];
+        const cutoff = Date.now() - 4 * 3600 * 1000;
+        for (let i = ts.length - 1; i >= 0; i--) { if (ts[i] * 1000 < cutoff && cs[i] != null) { prev = cs[i]; break; } }
+      }
+      if (price && prev) {
+        const pct = (price - prev) / prev * 100;
+        el.textContent = `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`;
+        el.style.color  = pct >= 0 ? '#3fb950' : '#ff7b72';
+        return;
+      }
+      // FMP backup — Yahoo missed; still within REGULAR hours so FMP is allowed.
       const fmpQ = await fetchFMPQuote('SPY');
       if (fmpQ?.price && fmpQ?.previousClose) {
         const pct = (fmpQ.price - fmpQ.previousClose) / fmpQ.previousClose * 100;
         el.textContent = `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`;
         el.style.color  = pct >= 0 ? '#3fb950' : '#ff7b72';
-        return;
+        logFmpUsage(['SPY'], 'spybox-mobile-fallback');
       }
-      // Yahoo fallback for regular — use fetchJSON (proxy chain handles CORS)
-      const yUrl = `https://query1.finance.yahoo.com/v8/finance/chart/SPY?interval=1d&range=5d&formatted=false&_cb=${Date.now()}`;
-      const data = await fetchJSON(yUrl);
-      const res  = data?.chart?.result?.[0];
-      if (!res) return;
-      const price = res.meta?.regularMarketPrice;
-      // Use regularMarketPreviousClose first; fall back to last completed daily candle
-      let prev = res.meta?.regularMarketPreviousClose ?? null;
-      if (!prev) {
-        const ts = res.timestamp ?? [], cs = res.indicators?.quote?.[0]?.close ?? [];
-        const cutoff = Date.now() - 4 * 3600 * 1000;
-        for (let i = ts.length - 1; i >= 0; i--) { if (ts[i] * 1000 < cutoff && cs[i] != null) { prev = cs[i]; break; } }
-      }
-      if (!price || !prev) return;
-      const pct = (price - prev) / prev * 100;
-      el.textContent = `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`;
-      el.style.color  = pct >= 0 ? '#3fb950' : '#ff7b72';
       return;
     }
 
@@ -2566,33 +2573,25 @@
     // Same PRE/AH fetch as the Alpha Picks tab (fetchPrices) -- CLOSED still needs the frozen
     // last post-market trade; only skip extended-hours calls during REGULAR when meaningless.
     const isExt = session !== 'REGULAR';
-    const [fmpQuotes, fmpExtended] = await Promise.all([
-      Promise.all(tickers.map(fetchFMPQuote)),
-      isExt ? Promise.all(tickers.map(fetchFMPExtended)) : Promise.resolve(tickers.map(() => null))
-    ]);
     const qMap = {};
-    tickers.forEach((t, i) => { if (fmpQuotes[i]) qMap[t] = normaliseFMP(fmpQuotes[i], fmpExtended[i], session); });
 
-    // FMP's free-tier quote endpoint itself frequently 429s (not just the extended-hours one) --
-    // when that happens qMap ends up EMPTY for every ticker and the extended-hours fallback below
-    // never even runs (it only patches tickers that already have a qMap entry). Without this,
-    // Brokerage/IRA/QG&I go completely blank on live refresh whenever FMP's rate limit is hit,
-    // even though Alpha Picks' fetchPrices() keeps working via this same fallback chain.
+    // Yahoo primary (v8 per-symbol chart). Yahoo's v7 batch quote endpoint requires auth (401
+    // as of 2026-07-27) so it's skipped entirely rather than wasting a round trip on it, same
+    // as the desktop app.
+    const fallbacks = await Promise.all(tickers.map(fetchTickerChart));
+    tickers.forEach((t, i) => { if (fallbacks[i]) qMap[t] = fallbacks[i]; });
+
+    // FMP backup — ONLY for tickers Yahoo missed, and ONLY during REGULAR hours. FMP's free
+    // tier is 250 calls/day total (confirmed 2026-07-30); this refresh firing on every
+    // 10-60 min auto-schedule tick regardless of session used to be a major FMP consumer.
     const missingQuote = tickers.filter(t => !qMap[t]);
-    if (missingQuote.length) {
-      const yahooUrl = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${missingQuote.join(',')}&formatted=false&_cb=${Date.now()}`;
-      let quoteData = null;
-      try {
-        const r = await fetch(yahooUrl, { cache: 'no-store' });
-        if (r.ok) quoteData = await r.json();
-      } catch {}
-      if (!quoteData) quoteData = await fetchJSON(yahooUrl);
-      (quoteData?.quoteResponse?.result ?? []).forEach(q => { qMap[q.symbol] = normaliseQuote(q); });
-      const stillMissing = missingQuote.filter(t => !qMap[t]);
-      if (stillMissing.length) {
-        const fallbacks = await Promise.all(stillMissing.map(fetchTickerChart));
-        stillMissing.forEach((t, i) => { if (fallbacks[i]) qMap[t] = fallbacks[i]; });
-      }
+    if (missingQuote.length && session === 'REGULAR') {
+      const fmpQuotes = await Promise.all(missingQuote.map(fetchFMPQuote));
+      const fmpUsed = [];
+      missingQuote.forEach((t, i) => {
+        if (fmpQuotes[i]) { qMap[t] = normaliseFMP(fmpQuotes[i], null, session); fmpUsed.push(t); }
+      });
+      logFmpUsage(fmpUsed, 'brokira-fallback');
     }
     if (!Object.keys(qMap).length) return;
 
@@ -2657,31 +2656,24 @@
     // CLOSED (evening + weekend) still needs the frozen last post-market trade fetched —
     // only skip extended-hours calls during REGULAR, when they're meaningless.
     const isExt   = session !== 'REGULAR';
-    const [fmpQuotes, fmpExtended] = await Promise.all([
-      Promise.all(tickers.map(fetchFMPQuote)),
-      isExt ? Promise.all(tickers.map(fetchFMPExtended)) : Promise.resolve(tickers.map(() => null))
-    ]);
     const quoteMap = {};
-    tickers.forEach((t, i) => { if (fmpQuotes[i]) quoteMap[t] = normaliseFMP(fmpQuotes[i], fmpExtended[i], session); });
 
+    // Yahoo primary (v8 per-symbol chart). Yahoo's v7 batch quote endpoint requires auth (401
+    // as of 2026-07-27) so it's skipped entirely, same as the desktop app.
+    const fallbacks = await Promise.all(tickers.map(fetchTickerChart));
+    tickers.forEach((t, i) => { if (fallbacks[i]) quoteMap[t] = fallbacks[i]; });
+
+    // FMP backup — ONLY for tickers Yahoo missed, and ONLY during REGULAR hours. FMP's free
+    // tier is 250 calls/day total (confirmed 2026-07-30); this used to fire for every ticker
+    // on every auto-refresh tick regardless of session.
     const missing = tickers.filter(t => !quoteMap[t]);
-    if (missing.length) {
-      // Try Yahoo v7 direct first (has CORS headers), then via codetabs proxy
-      const yahooUrl = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${missing.join(',')}&formatted=false&_cb=${Date.now()}`;
-      let quoteData = null;
-      try {
-        const r = await fetch(yahooUrl, { cache: 'no-store' });
-        if (r.ok) quoteData = await r.json();
-      } catch {}
-      if (!quoteData) {
-        quoteData = await fetchJSON(yahooUrl);
-      }
-      (quoteData?.quoteResponse?.result ?? []).forEach(q => { quoteMap[q.symbol] = normaliseQuote(q); });
-      const stillMissing = missing.filter(t => !quoteMap[t]);
-      if (stillMissing.length) {
-        const fallbacks = await Promise.all(stillMissing.map(fetchTickerChart));
-        stillMissing.forEach((t, i) => { if (fallbacks[i]) quoteMap[t] = fallbacks[i]; });
-      }
+    if (missing.length && session === 'REGULAR') {
+      const fmpQuotes = await Promise.all(missing.map(fetchFMPQuote));
+      const fmpUsed = [];
+      missing.forEach((t, i) => {
+        if (fmpQuotes[i]) { quoteMap[t] = normaliseFMP(fmpQuotes[i], null, session); fmpUsed.push(t); }
+      });
+      logFmpUsage(fmpUsed, 'alphapicks-mobile-fallback');
     }
 
     if (isExt) {
