@@ -623,24 +623,40 @@
   const GIST_ID    = 'ac2630f3f93387e8c6931ebb27d694a7';
   const GIST_TOKEN = '';
 
-  // HOME_SERVER: your desktop's LAN IP + port. Update if your router assigns a new IP.
-  // The app probes this at startup to auto-detect home vs away.
-  const HOME_SERVER = window.location.port === '7843' ? window.location.origin : 'http://192.168.1.139:7843';
+  // HOME_SERVER candidates: your desktop's LAN IP and Tailscale IP, both on port 7843.
+  // Update these if your router/Tailscale assigns new addresses.
+  // detectHomeMode() races BOTH so this one URL works whether you're on home WiFi (LAN answers)
+  // or away with the laptop reachable over Tailscale (LAN times out, Tailscale answers) — it used
+  // to only try the LAN address, so "away but laptop on" was indistinguishable from "laptop off"
+  // and always fell back to the (possibly stale) Gist snapshot even when a live fetch was possible.
+  const HOME_SERVER_CANDIDATES = window.location.port === '7843'
+    ? [window.location.origin]
+    : ['http://192.168.1.139:7843', 'http://100.119.49.20:7843'];
+
+  // HOME_SERVER starts as the first candidate and is updated to whichever one actually answers.
+  let HOME_SERVER = HOME_SERVER_CANDIDATES[0];
 
   // HOME_MODE starts as a quick URL check; detectHomeMode() refines it asynchronously.
-  // This lets the app work whether opened from http://192.168.1.x:7843/mobile  OR  file:// on phone.
+  // This lets the app work whether opened from http://192.168.1.x:7843/mobile, from GitHub
+  // Pages, or file:// on phone.
   let HOME_MODE = window.location.port === '7843';
 
   async function detectHomeMode() {
     if (HOME_MODE) return; // already confirmed by URL
-    // M2: 400 ms timeout — local server answers in <100 ms or isn't there; 2 s was too conservative.
-    const ac = new AbortController();
-    setTimeout(() => ac.abort(), 400);
+    // 800 ms timeout — up to two real network hops now (LAN + Tailscale, the latter often
+    // relayed) instead of one same-subnet address, so a bit more headroom than the old 400 ms.
+    const probes = HOME_SERVER_CANDIDATES.map(base => {
+      const ac = new AbortController();
+      const t  = setTimeout(() => ac.abort(), 800);
+      return fetch(`${base}/schwab/status`, { signal: ac.signal, cache: 'no-store', mode: 'no-cors' })
+        .then(() => base)
+        .finally(() => clearTimeout(t));
+    });
     try {
-      await fetch(`${HOME_SERVER}/schwab/status`, { signal: ac.signal, cache: 'no-store', mode: 'no-cors' });
+      HOME_SERVER = await Promise.any(probes); // first candidate to answer wins
       HOME_MODE = true;
     } catch {
-      HOME_MODE = false;
+      HOME_MODE = false; // both candidates failed/timed out
     }
   }
 
@@ -992,8 +1008,8 @@
       const ac  = new AbortController();
       const tid = setTimeout(() => ac.abort(), 4000);
       try {
-        dbg('trying local server…');
-        const resp = await fetch('/mobile-data', { cache: 'no-store', signal: ac.signal });
+        dbg(`trying local server… (${HOME_SERVER})`);
+        const resp = await fetch(`${HOME_SERVER}/mobile-data`, { cache: 'no-store', signal: ac.signal });
         clearTimeout(tid);
         if (resp.ok) {
           data   = await resp.json();
@@ -1994,14 +2010,16 @@
   }
 
   async function fetchJSON(url, timeoutMs = 4000) {
-    // In HOME_MODE the app is served from localhost:7843, so /proxy is same-origin (works).
-    // In AWAY_MODE (file:// or remote) skip localhost proxy — it would just fail.
+    // In HOME_MODE, HOME_SERVER points at whichever address (same-origin, LAN, or Tailscale)
+    // detectHomeMode() actually confirmed reachable, so /proxy always resolves to the real
+    // desktop server, not just when this page happens to be served BY it.
+    // In AWAY_MODE (no server reachable) skip this proxy — it would just fail.
     // Every attempt gets a per-attempt timeout (AbortController) so a hung/slow proxy can't
     // stall the call indefinitely — mirrors the desktop fetchJSON. A 502/CORS failure returns
     // or throws fast and moves on; this cap only bites when a proxy accepts the connection but
     // never responds. Worst case is timeoutMs × attempts instead of unbounded.
     const attempts = [
-      ...(HOME_MODE ? [(signal) => fetch(`/proxy?url=${encodeURIComponent(url)}`, { cache: 'no-store', signal })] : []),
+      ...(HOME_MODE ? [(signal) => fetch(`${HOME_SERVER}/proxy?url=${encodeURIComponent(url)}`, { cache: 'no-store', signal })] : []),
       (signal) => fetch(url, { cache: 'no-store', signal }),
       (signal) => fetch(`https://corsproxy.io/?${url}`, { cache: 'no-store', signal }),
       (signal) => fetch(`https://thingproxy.freeboard.io/fetch/${url}`, { cache: 'no-store', signal }),
@@ -2279,18 +2297,16 @@
     if (chipLabel) chipLabel.textContent = 'S&P FUT';
     const esUrl = `https://query1.finance.yahoo.com/v8/finance/chart/ES%3DF?interval=1m&range=5d&formatted=false&_cb=${Date.now()}`;
     let esData = null;
-    // Only try the local server proxy when actually at home — in AWAY/standalone mode these
-    // localhost URLs just eat a timeout before the public-proxy chain in fetchJSON takes over.
+    // Only try the local server proxy when actually at home/reachable — in AWAY mode this
+    // would just eat a timeout before the public-proxy chain in fetchJSON takes over.
+    // (Was hardcoded to http://localhost:7843, which on a phone means the phone itself, not
+    // the desktop — always failed there regardless of HOME_MODE. HOME_SERVER is the address
+    // detectHomeMode() actually confirmed reachable.)
     if (HOME_MODE) {
-      for (const proxyUrl of [
-        `http://localhost:7843/proxy?url=${encodeURIComponent(esUrl)}`,
-        `/proxy?url=${encodeURIComponent(esUrl)}`,
-      ]) {
-        try {
-          const r = await fetch(proxyUrl, { cache: 'no-store' });
-          if (r.ok) { esData = await r.json(); break; }
-        } catch {}
-      }
+      try {
+        const r = await fetch(`${HOME_SERVER}/proxy?url=${encodeURIComponent(esUrl)}`, { cache: 'no-store' });
+        if (r.ok) esData = await r.json();
+      } catch {}
     }
     if (!esData) esData = await fetchJSON(esUrl);
     if (!esData) { el.textContent = '—'; el.style.color = '#8b949e'; return; }
@@ -2375,8 +2391,9 @@
   }
 
   async function _mergeIntradayFromStore() {
+    if (!HOME_MODE) return; // no reachable desktop server to merge from (away/offline)
     try {
-      const res = await fetch('/store', { cache: 'no-store' });
+      const res = await fetch(`${HOME_SERVER}/store`, { cache: 'no-store' });
       if (!res.ok) return;
       const data = await res.json();
       const raw = data[_INTRADAY_LS];
