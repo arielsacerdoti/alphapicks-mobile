@@ -923,77 +923,12 @@
     container.appendChild(toast);
   }
 
-  // ── Daily portfolio log ───────────────────────────────────────────────────
-  function captureLogEntry(force = false) {
-    const parseNum = str => {
-      if (!str || str === '—') return '';
-      const m = str.replace(/,/g, '').match(/-?\d+\.?\d*/);
-      return m ? parseFloat(m[0]) : '';
-    };
-    try {
-      const etNow  = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
-      const MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-      const dateStr = `${String(etNow.getDate()).padStart(2,'0')}-${MON[etNow.getMonth()]}-${etNow.getFullYear()}`;
-      const dateKey = `${etNow.getFullYear()}-${String(etNow.getMonth()+1).padStart(2,'0')}-${String(etNow.getDate()).padStart(2,'0')}`;
-      const raw = JSON.parse(localStorage.getItem('alphapicks_log') || '[]');
-      const isToday = e => e.date === dateStr || e._key === dateKey || e.date === dateKey;
-      if (raw.some(isToday) && !force) return;
-      const log = raw.filter(e => !isToday(e));
-      const g    = id => document.getElementById(id)?.textContent?.trim() || '';
-      const gSpy = id => { const t = g(id); return parseNum(t.includes(':') ? t.split(':').pop() : t); };
-      const entry = {
-        date: dateStr, _key: dateKey,
-        totalInvested: parseNum(g('stat-total-invested')),
-        currentValue:  parseNum(g('stat-total-value')),
-        dailyChange:   parseNum(g('stat-daily-change')),
-        totalChange:   parseNum(g('stat-total-gain')),
-        pctChange:     parseNum(g('stat-pct-change')),
-        spyPct:        gSpy('stat-spy-pct'),
-        annualReturn:  parseNum(g('stat-annual-return')),
-        spyReturn:     gSpy('stat-spy-return'),
-        usdils:        parseNum(g('usdils-box')),
-      };
-      const domCards = [...document.querySelectorAll('#holdings-list .holding-card[data-ticker]')].reverse();
-      domCards.forEach(card => {
-        entry[card.dataset.ticker] = parseNum(card.querySelector('.cur-price')?.textContent?.trim());
-      });
-      entry._tickers = domCards.map(r => r.dataset.ticker);
-      log.unshift(entry);
-      localStorage.setItem('alphapicks_log', JSON.stringify(log));
-      console.log(`[Log] captured entry for ${dateStr} — log now has ${log.length} entries`);
-
-      const container = document.getElementById('div-toasts');
-      const toast = document.createElement('div');
-      toast.className = 'div-toast log';
-      toast.innerHTML = `
-        <span class="div-toast-icon">📊</span>
-        <span class="div-toast-body"><strong>Daily log captured</strong></span>
-        <button class="div-toast-close" onclick="this.closest('.div-toast').remove()">✕</button>`;
-      container.appendChild(toast);
-    } catch (err) {
-      console.error('[AlphaPicks] captureLogEntry failed:', err);
-    }
-  }
-
-  function checkDailyLog() {
-    const etStr  = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
-    const etNow  = new Date(etStr);
-    const hour   = etNow.getHours();
-    const dow    = etNow.getDay();
-    const dateStr = `${etNow.getFullYear()}-${String(etNow.getMonth()+1).padStart(2,'0')}-${String(etNow.getDate()).padStart(2,'0')}`;
-    const isHoliday = usMarketHolidays(etNow.getFullYear()).has(dateStr);
-    if (hour < 16)                          return;
-    if (dow === 0 || dow === 6 || isHoliday) return;
-    captureLogEntry(true);
-  }
-
-  function scheduleDailyLog() {
-    const etNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
-    const hour = etNow.getHours(), min = etNow.getMinutes(), sec = etNow.getSeconds();
-    if (hour >= 16) return;
-    const secsUntilClose = (16 * 3600 + 10) - (hour * 3600 + min * 60 + sec);
-    setTimeout(checkDailyLog, secsUntilClose * 1000);
-  }
+  // NOTE: mobile used to have its own independent daily log-capture mechanism here
+  // (captureLogEntry/checkDailyLog/scheduleDailyLog), mirroring the desktop app's. Removed
+  // 2026-07-31: it wrote to mobile's own local alphapicks_log copy, which nothing else in this
+  // page ever reads and which was never synced to the server -- a dead end that produced a
+  // "Daily log captured" toast every day past market close for a capture that served no
+  // purpose. The desktop app is the sole owner of the log/Excel file; mobile only ever reads.
 
 
   // ── Sync: HOME (local server) or AWAY (JSONBin / cache) ──────────────────
@@ -2916,7 +2851,6 @@
     fetchUsdIls();
     refreshBrokIraPrices();  // live prices for Brokerage + IRA regardless of sync age
     checkBuyCallReminder();
-    checkDailyLog();
     checkDivAlerts();
 
     // Schedule next auto-refresh: sync from cloud then re-fetch prices
@@ -3032,8 +2966,6 @@
     syncFromCloud().then(() => {
       fetchPrices(); // always re-run after sync so fresh synced dayPct values feed the portfolio total
       _mergeIntradayFromStore();
-      scheduleDailyLog();
-      setInterval(checkDailyLog, 60 * 1000);
     });
   });
   // ── Pull-to-refresh ───────────────────────────────────────────────────────
