@@ -615,13 +615,11 @@
 <script>
   const FMP_KEY     = 'RifQbMNRIh92cgRC44u30scmkMK0l0gK';
   // GitHub Gist — same values as in AlphaPicks Portfolio.html
-  // NOTE: no token here on purpose. This copy is published to a public/semi-public host
-  // (GitHub Pages), unlike the desktop copy which only ever runs on the home LAN/Tailscale --
-  // a token embedded in page source here would be extractable by anyone with the URL. The
-  // secret-gist raw URL and codetabs fallbacks below don't need auth, so nothing is lost.
   const GIST_USER  = 'arielsacerdoti';
   const GIST_ID    = 'ac2630f3f93387e8c6931ebb27d694a7';
-  const GIST_TOKEN = '';
+  const GIST_TOKEN = ''; // NEVER commit a real token here — this file is public (GitHub Pages).
+                          // Gist is public-readable, so the raw-URL fetch path works without one;
+                          // GIST_TOKEN only helps the gh-api fallback and is optional.
 
   // HOME_SERVER candidates: your desktop's LAN IP and Tailscale IP, both on port 7843.
   // Update these if your router/Tailscale assigns new addresses.
@@ -1003,10 +1001,7 @@
           return fetch(url, { cache: 'no-store', signal: ac.signal, ...opts }).finally(() => clearTimeout(t));
         };
         const attempts = [
-          // GitHub REST API — works anonymously for a secret gist too (the id itself is the
-          // only "secret"); only add the Authorization header when a token is actually set,
-          // since sending an empty Bearer value gets rejected as a malformed credential
-          // instead of being treated as an anonymous request.
+          // GitHub REST API — authenticated, reliable CORS from any origin
           { label: 'gh-api', fn: () => fetchWithTimeout(`https://api.github.com/gists/${GIST_ID}`, 8000,
                 { headers: { ...(GIST_TOKEN ? { 'Authorization': `Bearer ${GIST_TOKEN}` } : {}), 'Accept': 'application/vnd.github+json' } })
               .then(async r => {
@@ -2044,6 +2039,43 @@
     };
   }
 
+  // ── Schwab Market Data (primary price source, HOME_MODE only) ────────────
+  // Mirrors the desktop mapping (AlphaPicks Portfolio.html normaliseSchwabQuote) — see that
+  // file for the field-semantics reasoning. Only reachable when the desktop server is up
+  // (HOME_MODE), so away-mode always falls straight through to Yahoo/FMP below.
+  function normaliseSchwabQuote(sq, session) {
+    const q = sq?.quote, reg = sq?.regular, ext = sq?.extended;
+    if (!q) return null;
+    const price = reg?.regularMarketLastPrice ?? q.closePrice ?? q.mark ?? q.lastPrice;
+    if (price == null) return null;
+    const netChange = reg?.regularMarketNetChange;
+    const prevClose = (netChange != null) ? price - netChange : q.closePrice;
+    const extValid = ext && ext.quoteTime > 0 && ext.lastPrice > 0;
+    return normaliseQuote({
+      regularMarketPrice:         price,
+      regularMarketPreviousClose: prevClose,
+      preMarketPrice:  (extValid && session === 'PRE')  ? ext.lastPrice : null,
+      postMarketPrice: (extValid && session === 'POST') ? ext.lastPrice : null,
+    });
+  }
+
+  async function fetchSchwabQuotesBatched(symbols) {
+    if (!symbols.length || !HOME_MODE) return {};
+    const session = getSessionFromClock();
+    const apiPath = `/marketdata/v1/quotes?symbols=${encodeURIComponent(symbols.join(','))}`;
+    try {
+      const resp = await fetch(`${HOME_SERVER}/schwab/api?path=${encodeURIComponent(apiPath)}`, { cache: 'no-store' });
+      if (!resp.ok) return {};
+      const data = await resp.json();
+      const out = {};
+      symbols.forEach(sym => {
+        const nq = normaliseSchwabQuote(data[sym], session);
+        if (nq) out[sym] = nq;
+      });
+      return out;
+    } catch { return {}; }
+  }
+
   async function fetchExtendedHours(ticker) {
     const url  = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1m&range=1d&includePrePost=true&_cb=${Date.now()}`;
     const data = await fetchJSON(url);
@@ -2217,9 +2249,16 @@
     const chipLabel = document.getElementById('spy-chip-label');
     const session   = getSessionFromClock();
 
-    // ── During REGULAR session: use SPY live price (Yahoo primary, FMP backup) ──
+    // ── During REGULAR session: use SPY live price (Schwab primary, Yahoo/FMP backup) ──
     if (session === 'REGULAR') {
       if (chipLabel) chipLabel.textContent = 'S&P 500';
+      const swQuote = (await fetchSchwabQuotesBatched(['SPY'])).SPY;
+      if (swQuote?.regularMarketChangePercent != null) {
+        const pct = swQuote.regularMarketChangePercent;
+        el.textContent = `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`;
+        el.style.color  = pct >= 0 ? '#3fb950' : '#ff7b72';
+        return;
+      }
       const yUrl = `https://query1.finance.yahoo.com/v8/finance/chart/SPY?interval=1d&range=5d&formatted=false&_cb=${Date.now()}`;
       const data = await fetchJSON(yUrl);
       const res  = data?.chart?.result?.[0];
@@ -2525,13 +2564,17 @@
     const isExt = session !== 'REGULAR';
     const qMap = {};
 
-    // Yahoo primary (v8 per-symbol chart). Yahoo's v7 batch quote endpoint requires auth (401
-    // as of 2026-07-27) so it's skipped entirely rather than wasting a round trip on it, same
-    // as the desktop app.
-    const fallbacks = await Promise.all(tickers.map(fetchTickerChart));
-    tickers.forEach((t, i) => { if (fallbacks[i]) qMap[t] = fallbacks[i]; });
+    // Schwab Market Data primary (HOME_MODE only, one call, same OAuth token as positions).
+    Object.assign(qMap, await fetchSchwabQuotesBatched(tickers));
 
-    // FMP backup — ONLY for tickers Yahoo missed, and ONLY during REGULAR hours. FMP's free
+    // Yahoo fallback for anything Schwab missed (or away mode). Yahoo's v7 batch quote endpoint
+    // requires auth (401 as of 2026-07-27) so it's skipped entirely rather than wasting a round
+    // trip on it, same as the desktop app.
+    const stillNeeded = tickers.filter(t => !qMap[t]);
+    const fallbacks = await Promise.all(stillNeeded.map(fetchTickerChart));
+    stillNeeded.forEach((t, i) => { if (fallbacks[i]) qMap[t] = fallbacks[i]; });
+
+    // FMP backup — ONLY for tickers Schwab+Yahoo both missed, and ONLY during REGULAR hours. FMP's free
     // tier is 250 calls/day total (confirmed 2026-07-30); this refresh firing on every
     // 10-60 min auto-schedule tick regardless of session used to be a major FMP consumer.
     const missingQuote = tickers.filter(t => !qMap[t]);
@@ -2608,12 +2651,16 @@
     const isExt   = session !== 'REGULAR';
     const quoteMap = {};
 
-    // Yahoo primary (v8 per-symbol chart). Yahoo's v7 batch quote endpoint requires auth (401
-    // as of 2026-07-27) so it's skipped entirely, same as the desktop app.
-    const fallbacks = await Promise.all(tickers.map(fetchTickerChart));
-    tickers.forEach((t, i) => { if (fallbacks[i]) quoteMap[t] = fallbacks[i]; });
+    // Schwab Market Data primary (HOME_MODE only, one call, same OAuth token as positions).
+    Object.assign(quoteMap, await fetchSchwabQuotesBatched(tickers));
 
-    // FMP backup — ONLY for tickers Yahoo missed, and ONLY during REGULAR hours. FMP's free
+    // Yahoo fallback for anything Schwab missed (or away mode). Yahoo's v7 batch quote endpoint
+    // requires auth (401 as of 2026-07-27) so it's skipped entirely, same as the desktop app.
+    const stillNeededP = tickers.filter(t => !quoteMap[t]);
+    const fallbacks = await Promise.all(stillNeededP.map(fetchTickerChart));
+    stillNeededP.forEach((t, i) => { if (fallbacks[i]) quoteMap[t] = fallbacks[i]; });
+
+    // FMP backup — ONLY for tickers Schwab+Yahoo both missed, and ONLY during REGULAR hours. FMP's free
     // tier is 250 calls/day total (confirmed 2026-07-30); this used to fire for every ticker
     // on every auto-refresh tick regardless of session.
     const missing = tickers.filter(t => !quoteMap[t]);
