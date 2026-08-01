@@ -676,6 +676,21 @@
     } catch (_) {}
   }
 
+  // Best-effort report of every time Yahoo's v8 chart came back with no usable price at all.
+  // See the matching function/comment in AlphaPicks Portfolio.html (2026-08-01) -- FMP can only
+  // serve ~5 of our ~60 real holdings on the current plan, so Yahoo is the only real source for
+  // most positions here too.
+  function logYahooFailure(symbol) {
+    if (!symbol || !HOME_MODE) return;
+    try {
+      fetch(`${HOME_SERVER}/yahoo-failure-log`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ symbol }),
+      }).catch(() => {});
+    } catch (_) {}
+  }
+
   let rows, tickers, divCache = {};
 
   function dbg() {} // no-op
@@ -2083,7 +2098,7 @@
     const url  = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=1d&_cb=${Date.now()}`;
     const data = await fetchJSON(url);
     const meta = data?.chart?.result?.[0]?.meta;
-    if (!meta || !meta.regularMarketPrice) return null;
+    if (!meta || !meta.regularMarketPrice) { logYahooFailure(ticker); return null; }
     return normaliseQuote({
       regularMarketPrice:         meta.regularMarketPrice,
       regularMarketPreviousClose: meta.chartPreviousClose ?? meta.previousClose,
