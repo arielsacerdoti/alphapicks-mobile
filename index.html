@@ -658,6 +658,27 @@
     }
   }
 
+  // Cheap liveness check against the CONFIRMED HOME_SERVER. Distinguishes
+  // "the desktop server is busy" from "there is no desktop server", which
+  // /mobile-data alone cannot tell apart -- it does real work (Schwab positions
+  // + prices) so a timeout there says nothing about reachability.
+  //
+  // /schwab/status is used deliberately: it returns immediately and does not
+  // touch the price path. Not `mode:'no-cors'` here (unlike detectHomeMode,
+  // which only needs to know that *something* answered) because we need to read
+  // resp.ok -- an opaque response would make a 500 look like success.
+  async function probeHomeServer(timeoutMs = 2500) {
+    try {
+      const ac = new AbortController();
+      const t  = setTimeout(() => ac.abort(), timeoutMs);
+      const resp = await fetch(`${HOME_SERVER}/schwab/status`, { cache: 'no-store', signal: ac.signal });
+      clearTimeout(t);
+      return resp.ok;
+    } catch {
+      return false;
+    }
+  }
+
   // Best-effort report of every time FMP got used as a Yahoo-miss backup, so real-world call
   // volume after the Yahoo-primary/FMP-backup change (2026-07-30) can be measured instead of
   // estimated -- see Write-FmpUsage / fmp_usage.log in schwab_server.ps1. Only fires when a
@@ -985,8 +1006,21 @@
         }
       } catch (e) {
         clearTimeout(tid);
-        dbg(`local server fail: ${e.message} → trying Gist`);
-        HOME_MODE = false;
+        // A slow or failed /mobile-data does NOT mean we are away from home.
+        // That endpoint recomputes live Schwab positions and prices when its
+        // 10-minute cache is stale, and any hiccup used to flip HOME_MODE off
+        // PERMANENTLY for the rest of the session. Because Schwab price
+        // fetching is gated on HOME_MODE, that silently downgraded the whole
+        // page to away-mode behaviour while sitting at home: no Schwab quotes,
+        // every symbol falling through to Yahoo, and ~40 extended-hours chart
+        // requests per refresh. Confirmed 2026-08-03 -- the page was serving
+        // FROM localhost:7843 and still reported HOME_MODE=false.
+        //
+        // Re-probe with a cheap endpoint before giving up. Only a server that
+        // genuinely does not answer means away mode; a busy one still gives us
+        // live Schwab prices even if this snapshot has to come from the Gist.
+        HOME_MODE = await probeHomeServer();
+        dbg(`local /mobile-data fail: ${e.message} → server reachable: ${HOME_MODE}`);
       }
     }
 
@@ -2050,13 +2084,28 @@
     if (price == null) return null;
     const netChange = reg?.regularMarketNetChange;
     const prevClose = (netChange != null) ? price - netChange : q.closePrice;
+    // Sanity guard: quote.closePrice has been observed to drift to a stale/rolled-over value
+    // over a weekend while regular.regularMarketLastPrice stays fixed (confirmed 2026-08-01) --
+    // if that ever produces an implausible swing, reject the whole quote rather than risk
+    // corrupting G/L, and let the caller fall through to Yahoo.
+    if (!prevClose || Math.abs((price - prevClose) / prevClose) > 0.5) return null;
     const extValid = ext && ext.quoteTime > 0 && ext.lastPrice > 0;
-    return normaliseQuote({
+    const out = normaliseQuote({
       regularMarketPrice:         price,
       regularMarketPreviousClose: prevClose,
       preMarketPrice:  (extValid && session === 'PRE')  ? ext.lastPrice : null,
       postMarketPrice: (extValid && session === 'POST') ? ext.lastPrice : null,
     });
+    // Schwab answers the extended-hours question definitively -- an omitted
+    // `extended` block means "did not trade outside regular hours", not
+    // "unknown". Without this flag every quiet symbol triggered a Yahoo
+    // 1m-chart fetch, ~50 of them fired at once through the local proxy, which
+    // is single-threaded. Mobile aborts each attempt at 4s (desktop waits 10s)
+    // and then cascades to public proxies, so the same flaw degraded mobile far
+    // worse than desktop. Measured 2026-08-03 02:14 ET: only 5 of 16 symbols
+    // had any pre-market print.
+    out.extResolved = true;
+    return out;
   }
 
   async function fetchSchwabQuotesBatched(symbols) {
@@ -2594,7 +2643,9 @@
     // whenever FMP alone comes up empty.
     if (isExt) {
       const needsExtFallback = tickers.filter(t => {
-        const q = qMap[t]; if (!q) return false;
+        // extResolved => Schwab already reported whether this symbol traded
+        // outside regular hours (see normaliseSchwabQuote).
+        const q = qMap[t]; if (!q || q.extResolved) return false;
         return session === 'PRE' ? q.preMarketPrice == null : q.postMarketPrice == null;
       });
       if (needsExtFallback.length) {
@@ -2675,7 +2726,9 @@
 
     if (isExt) {
       const needsExtFallback = tickers.filter(t => {
-        const q = quoteMap[t]; if (!q) return false;
+        // extResolved => Schwab already reported whether this symbol traded
+        // outside regular hours (see normaliseSchwabQuote).
+        const q = quoteMap[t]; if (!q || q.extResolved) return false;
         return session === 'PRE' ? q.preMarketPrice == null : q.postMarketPrice == null;
       });
       if (needsExtFallback.length) {
