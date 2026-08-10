@@ -282,8 +282,9 @@
       box-shadow: 0 4px 20px rgba(0,0,0,0.5); animation: toastIn 0.2s ease;
     }
     .div-toast.pay     { background: #1c1f2a; border-color: #58a6ff; }
-    .div-toast.buycall { background: #2a1f0e; border-color: #d29922; }
-    .div-toast.log     { background: #0e1f2a; border-color: #58a6ff; }
+    .div-toast.buycall  { background: #2a1f0e; border-color: #d29922; }
+    .div-toast.log      { background: #0e1f2a; border-color: #58a6ff; }
+    .div-toast.earnings { background: #1e1028; border-color: #a371f7; }
     .div-toast-icon { font-size: 1rem; flex-shrink: 0; }
     .div-toast-body { flex: 1; }
     .div-toast-close {
@@ -1600,6 +1601,71 @@
     container.appendChild(toast);
     notified[todayStr] = true;
     localStorage.setItem('alphapicks_buycall_notified', JSON.stringify(notified));
+  }
+
+  function showEarningsToast(ticker, daysUntil, dateStr) {
+    const container = document.getElementById('div-toasts');
+    const toast = document.createElement('div');
+    toast.className = 'div-toast earnings';
+    const when = daysUntil === 0 ? 'TODAY' : daysUntil === 1 ? 'tomorrow' : daysUntil === -1 ? 'YESTERDAY' : `in ${daysUntil} days`;
+    toast.innerHTML = `
+      <span class="div-toast-icon">📊</span>
+      <span class="div-toast-body"><strong>${ticker}</strong> earnings call <strong>${when}</strong> <span style="color:#8b949e;font-size:0.8em">(${dateStr})</span></span>
+      <button class="div-toast-close" onclick="this.closest('.div-toast').remove()">✕</button>`;
+    container.appendChild(toast);
+  }
+
+  // Ported from desktop AlphaPicks Portfolio.html (2026-08-10), already fixed there:
+  // FMP's endpoint is /stable/earnings-calendar (plural) and there is deliberately no
+  // Yahoo v7 fallback -- that endpoint has required auth since 2026-07-27, and on desktop
+  // it silently hung every check for up to ~2 minutes walking fetchJSON's 3-proxy timeout
+  // chain before giving up.
+  // The global `tickers` (from syncRows()) only covers the Alpha Picks tab -- Brokerage/IRA/QG&I
+  // cards are rendered without a data-ticker attribute at all (confirmed 2026-08-10), so their
+  // symbols have to come from the raw synced position arrays instead, same as refreshBrokIraPrices().
+  async function checkEarningsAlerts() {
+    const allPos = [_lastBrokData, _lastIraData, _lastQgiData].flatMap(d => d?.positions || []);
+    const allSymbols = [...new Set([...tickers, ...allPos.filter(p => !p.hgi && p.symbol).map(p => p.symbol)])];
+    if (!allSymbols.length) return;
+    const notified = JSON.parse(localStorage.getItem('alphapicks_earnings_notified') || '{}');
+    let changed = false;
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const fmt = d => d.toISOString().split('T')[0];
+    const yesterday = new Date(today); yesterday.setDate(today.getDate() - 1);
+    const tomorrow  = new Date(today); tomorrow.setDate(today.getDate() + 1);
+    const earningsMap = {};
+
+    const earningsCache = JSON.parse(localStorage.getItem('alphapicks_earnings_dates') || '{}');
+    for (const sym of allSymbols) {
+      const dateStr = earningsCache[sym];
+      if (!dateStr) continue;
+      const diff = Math.round((new Date(dateStr) - today) / 86400000);
+      if (diff >= -1 && diff <= 1) earningsMap[sym] = dateStr;
+    }
+
+    const needLive = allSymbols.filter(s => !earningsMap[s]);
+    if (needLive.length) {
+      try {
+        const url = `https://financialmodelingprep.com/stable/earnings-calendar` +
+                    `?from=${fmt(yesterday)}&to=${fmt(tomorrow)}&apikey=${FMP_KEY}`;
+        const data = await fetch(url).then(r => r.json());
+        for (const ev of data ?? []) {
+          if (ev.symbol && ev.date && needLive.includes(ev.symbol)) earningsMap[ev.symbol] = ev.date;
+        }
+      } catch(e) { console.warn('[Earnings] FMP calendar failed:', e.message); }
+    }
+
+    for (const [ticker, dateStr] of Object.entries(earningsMap)) {
+      const earningsDate = new Date(dateStr + 'T00:00:00');
+      const daysUntil = Math.round((earningsDate - today) / 86400000);
+      if (daysUntil < -1 || daysUntil > 1) continue;
+      const notifKey = `${ticker}_earnings_${dateStr}`;
+      if (notified[notifKey]) continue;
+      showEarningsToast(ticker, daysUntil, dateStr);
+      notified[notifKey] = true;
+      changed = true;
+    }
+    if (changed) localStorage.setItem('alphapicks_earnings_notified', JSON.stringify(notified));
   }
 
   async function checkDivAlerts() {
@@ -3075,6 +3141,7 @@
     refreshBrokIraPrices();  // live prices for Brokerage + IRA regardless of sync age
     checkBuyCallReminder();
     checkDivAlerts();
+    checkEarningsAlerts();
 
     // Schedule next auto-refresh: sync from cloud then re-fetch prices
     const _session  = getSessionFromClock();
