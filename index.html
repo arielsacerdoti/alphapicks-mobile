@@ -384,10 +384,11 @@
   </div>
   <div class="header-meta-row">
     <div class="as-of">Rev. <span id="revision-date"></span>
-      <script>
-        document.getElementById('revision-date').textContent =
-          new Date(document.lastModified).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
-      </script>
+      <!-- Populated later, after REVISION_DATE is declared -- see that constant's comment.
+           document.lastModified was never actually meaningful here: this page is served
+           with no Last-Modified header locally (so it defaulted to "now", not the real edit
+           date) and GitHub Pages' CDN value for it is not something we control or can trust
+           either. Confirmed 2026-08-10. -->
     </div>
     <div class="market-row">
       <span class="market-item">
@@ -613,13 +614,30 @@
 </div>
 
 <script>
+  // Bump on every meaningfully-behavior-changing commit to THIS file (not typo/comment
+  // fixes) -- independent of Portfolio.html's own BUILD_VERSION, since the two files are
+  // edited and deployed independently and each needs to say when IT was last really changed.
+  const REVISION_DATE = '2026-08-10';
+  {
+    const el = document.getElementById('revision-date');
+    if (el) {
+      el.textContent = new Date(REVISION_DATE + 'T12:00:00')
+        .toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+    }
+  }
+
   const FMP_KEY     = 'RifQbMNRIh92cgRC44u30scmkMK0l0gK';
   // GitHub Gist — same values as in AlphaPicks Portfolio.html
   const GIST_USER  = 'arielsacerdoti';
   const GIST_ID    = 'ac2630f3f93387e8c6931ebb27d694a7';
-  const GIST_TOKEN = ''; // NEVER commit a real token here — this file is public (GitHub Pages).
-                          // Gist is public-readable, so the raw-URL fetch path works without one;
-                          // GIST_TOKEN only helps the gh-api fallback and is optional.
+  // No token here, deliberately. This file is copied verbatim to the PUBLIC
+  // GitHub Pages repo, and a hardcoded PAT was re-added to git history twice
+  // (scrubbed 2026-08-01, blocked again by push protection 2026-08-03).
+  //
+  // It is not needed: the gist is public, so the raw-URL fetch path works
+  // unauthenticated. GIST_TOKEN only ever helped the gh-api fallback, which is
+  // skipped when empty.
+  const GIST_TOKEN = '';
 
   // HOME_SERVER candidates: your desktop's LAN IP and Tailscale IP, both on port 7843.
   // Update these if your router/Tailscale assigns new addresses.
@@ -2089,7 +2107,11 @@
     // if that ever produces an implausible swing, reject the whole quote rather than risk
     // corrupting G/L, and let the caller fall through to Yahoo.
     if (!prevClose || Math.abs((price - prevClose) / prevClose) > 0.5) return null;
-    const extValid = ext && ext.quoteTime > 0 && ext.lastPrice > 0;
+    // extended.quoteTime is the last two-sided-quote time and is routinely 0 outside
+    // regular hours even when a real trade printed -- see the desktop's copy of this
+    // function for the confirmed case (MU, 2026-08-06). tradeTime is the actual
+    // last-trade timestamp; check that (falling back to quoteTime too).
+    const extValid = ext && (ext.tradeTime > 0 || ext.quoteTime > 0) && ext.lastPrice > 0;
     const out = normaliseQuote({
       regularMarketPrice:         price,
       regularMarketPreviousClose: prevClose,
@@ -2139,8 +2161,12 @@
     } catch { return {}; }
   }
 
+  // range=5d, not range=1d: confirmed 2026-08-06 that Yahoo's v8 chart silently returns
+  // zero candles for interval=1m + includePrePost=true + range=1d (every symbol, not just
+  // illiquid ones). range=5d with the same params works; the window-scan below already
+  // filters to today's period by timestamp regardless of how many days came back.
   async function fetchExtendedHours(ticker) {
-    const url  = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1m&range=1d&includePrePost=true&_cb=${Date.now()}`;
+    const url  = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1m&range=5d&includePrePost=true&_cb=${Date.now()}`;
     const data = await fetchJSON(url);
     const result = data?.chart?.result?.[0];
     if (!result) return null;
@@ -2728,6 +2754,13 @@
       return;
     }
     setStatus('loading', 'Refreshing…');
+    // Fire-and-forget: fetchSpyBox() was written (ES=F futures for PRE/POST/CLOSED, away-mode
+    // aware) but never actually called from anywhere -- confirmed 2026-08-08, the header S&P
+    // chip was silently relying entirely on whatever spyChipText the desktop last pushed to the
+    // Gist, frozen at that value for as long as the desktop wasn't running to push a fresher
+    // one. Not awaited: it does its own network fetch and must not slow down position pricing,
+    // and a failure here (element missing, fetch error) must not abort the rest of this cycle.
+    fetchSpyBox().catch(e => console.warn('[SpyBox]', e.message));
     const session = getSessionFromClock();
     // CLOSED (evening + weekend) still needs the frozen last post-market trade fetched —
     // only skip extended-hours calls during REGULAR, when they're meaningless.
