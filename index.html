@@ -52,8 +52,9 @@
     .refresh-top    { display: flex; align-items: center; gap: 0.4rem; flex-wrap: nowrap; white-space: nowrap; }
     .header-meta-row { display: flex; align-items: center; justify-content: space-between;
                        margin-top: 0.35rem; }
+    /* was nowrap: fine for 2 items (S&P, ₪), but a 3rd (Nasdaq) risks overflow on narrow phones */
     .market-row      { display: flex; align-items: center; gap: 0.4rem; font-size: 0.68rem;
-                       flex-wrap: nowrap; }
+                       flex-wrap: wrap; justify-content: flex-end; }
     .market-item    { display: flex; align-items: center; gap: 0.22rem;
                       background: #1c2128; border: 1px solid #444c56;
                       border-radius: 6px; padding: 0.18rem 0.5rem; }
@@ -395,6 +396,10 @@
       <span class="market-item">
         <span class="market-lbl" id="spy-chip-label">S&amp;P</span>
         <span id="spy-pct-box" style="color:#8b949e">—</span>
+      </span>
+      <span class="market-item">
+        <span class="market-lbl">Nasdaq</span>
+        <span id="nasdaq-pct-box" style="color:#8b949e">—</span>
       </span>
       <span class="market-item">
         <span class="market-lbl">₪</span>
@@ -1161,6 +1166,12 @@
       const labelEl  = document.getElementById('spy-chip-label');
       if (spyEl)   { spyEl.textContent = data.spyChipText; spyEl.style.color = data.spyChipColor || '#8b949e'; }
       if (labelEl && data.spyChipLabel) labelEl.textContent = data.spyChipLabel;
+    }
+
+    // Nasdaq header chip — same pattern as S&P, replicate desktop value verbatim
+    if (data.nasdaqChipText) {
+      const nasdaqEl = document.getElementById('nasdaq-pct-box');
+      if (nasdaqEl) { nasdaqEl.textContent = data.nasdaqChipText; nasdaqEl.style.color = data.nasdaqChipColor || '#8b949e'; }
     }
 
     // Render Brokerage tab
