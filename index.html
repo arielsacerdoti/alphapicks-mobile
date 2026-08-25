@@ -794,6 +794,12 @@
   let _syncedAlphaPicksIrrRate    = null;  // Annual Return  (XIRR)
   let _syncedAlphaPicksSpyIrrRate = null;  // S&P 500 Annual Return benchmark
   let _syncedAlphaPicksSpySimRet  = null;  // S&P 500 Total % Change benchmark
+  // Whether desktop has a fully-closed tagged position for this tab (real trade history, no
+  // live shares -- desktop's QGI-1/loadIRRData virtual rows). The local flowsTabRate pool below
+  // only ever sees currently-held positions (closed ones have no card/row to build from), so it
+  // would silently regress desktop's closed-position IRR fix by excluding their history. When
+  // true, skip the local pool and defer to _syncedAlphaPicksIrrRate instead (2026-08-25).
+  let _syncedAlphaPicksHasClosed  = false;
 
   // Reconciled per-position cash-flows for Alpha Picks, keyed by ticker — shipped in the sync
   // payload and stashed here by appendPositionCard so the DOM-row-based price loop can compute
@@ -1159,6 +1165,7 @@
     _syncedAlphaPicksIrrRate    = data.alphaPicksIrrRate      ?? null;
     _syncedAlphaPicksSpyIrrRate = data.alphaPicksSpyIrrRate   ?? null;
     _syncedAlphaPicksSpySimRet  = data.alphaPicksSpySimpleRet ?? null;
+    _syncedAlphaPicksHasClosed  = !!data.alphaPicksHasClosedPositions;
 
     // S&P header chip — replicate desktop value verbatim
     if (data.spyChipText) {
@@ -1197,10 +1204,11 @@
       }));
       _lastQgiData = { positions: qgiCards, irrRate: data.qgiIrrRate ?? null,
         spyIrrRate: data.qgiSpyIrrRate ?? null, spySimRet: data.qgiSpySimpleRet ?? null,
-        benchIrrRate: data.qgiBenchIrrRate ?? null, benchSimRet: data.qgiBenchSimpleRet ?? null };
+        benchIrrRate: data.qgiBenchIrrRate ?? null, benchSimRet: data.qgiBenchSimpleRet ?? null,
+        hasClosedPositions: !!data.qgiHasClosedPositions };
       renderAccountCards('qgi-list', 'qgi-total-bar', qgiCards,
         data.qgiIrrRate ?? null, data.qgiSpyIrrRate ?? null, data.qgiSpySimpleRet ?? null,
-        data.qgiBenchIrrRate ?? null, data.qgiBenchSimpleRet ?? null);
+        data.qgiBenchIrrRate ?? null, data.qgiBenchSimpleRet ?? null, !!data.qgiHasClosedPositions);
     }
     // Render Allocation tab
     if (data.allocation) renderAllocDonuts(data.allocation);
@@ -1224,7 +1232,11 @@
 
   function fmtAcct(n) { return n != null ? `$${fmtD(n)}` : '—'; }
 
-  function renderAccountCards(listId, totalBarId, positions, tabIrrRate = null, tabSpyIrrRate = null, tabSpySimpleRet = null, tabBenchIrrRate = null, tabBenchSimpleRet = null) {
+  // hasClosedPositions: true when desktop has a fully-closed tagged position for this tab (real
+  // trade history, no live shares -- see QGI-1/loadIRRData's virtual rows). Only ever true for
+  // qgi today (Brokerage/IRA have no equivalent tagged-list concept). Gates the local pooled
+  // recompute below -- see its own comment for why (2026-08-25).
+  function renderAccountCards(listId, totalBarId, positions, tabIrrRate = null, tabSpyIrrRate = null, tabSpySimpleRet = null, tabBenchIrrRate = null, tabBenchSimpleRet = null, hasClosedPositions = false) {
     const list     = document.getElementById(listId);
     const totalBar = document.getElementById(totalBarId);
     if (!list) return;
@@ -1373,7 +1385,13 @@
     // Color: binary green/red (≥0 = green) — matches desktop renderTabStats
     let annualValHtml = '<span style="color:#8b949e">—</span>';
     let tabRate = null;
-    {
+    // Skip the local pool entirely when desktop has a closed position for this tab -- `positions`
+    // here only ever covers currently-held tickers (a closed position has no card to build one
+    // from), so pooling them would silently exclude a closed position's real cash-flow history
+    // and understate the rate, regressing desktop's own closed-position IRR fix (QGI-1,
+    // 2026-08-25). tabRate stays null and falls through to tabIrrRate below, which already
+    // includes it correctly.
+    if (!hasClosedPositions) {
       const pooled = [];
       let liveTerm = 0;
       positions.forEach(pos => {
@@ -2309,7 +2327,8 @@
       if (post != null && prev) { postChg = post - prev; postPct = (postChg / prev) * 100; }
     }
     return { preMarketPrice: pre, preMarketChange: preChg, preMarketChangePercent: prePct,
-             postMarketPrice: post, postMarketChange: postChg, postMarketChangePercent: postPct };
+             postMarketPrice: post, postMarketChange: postChg, postMarketChangePercent: postPct,
+             chartPreviousClose: prev };   // expose so callers can use this as their PRE/AH % reference
   }
 
   async function fetchTickerChart(ticker) {
@@ -2794,6 +2813,12 @@
             qMap[t].postMarketPrice         = ext.postMarketPrice;
             qMap[t].postMarketChange        = ext.postMarketChange;
             qMap[t].postMarketChangePercent = ext.postMarketChangePercent;
+            // fetchExtendedHours() already candle-scans a correct "yesterday's close" every
+            // cycle -- ported from desktop commits d2345e7/40276c4/b4485e3 (2026-08-25): a
+            // persisted cache can go stale, and regularMarketPreviousClose/regularMarketPrice
+            // can resolve a session further back than intended. A reference recomputed fresh
+            // every cycle can't go stale the way either fallback can, so it wins priority below.
+            qMap[t]._freshRef = ext.chartPreviousClose ?? null;
           }
         });
       }
@@ -2812,15 +2837,19 @@
       if (!price) return pos;
       const mktVal = price * (pos.shares || 0);
       const isExtHours = (q.isPre && q.preMarketPrice != null) || (q.postMarketPrice != null);
-      const ref        = q.regularMarketPrice;
-      const dayPct     = isExtHours && ref ? (price - ref) / ref * 100 : q.regularMarketChangePercent;
+      const ref        = q._freshRef ?? q.regularMarketPrice;
+      // Gated on isExt (any non-REGULAR session), not isExtHours (a confirmed real tick) --
+      // ported from desktop commit b4485e3: a ticker with NO genuine extended print at all
+      // used to fall all the way through to q.regularMarketChangePercent, the raw provider's
+      // own regular-session % change -- exactly as session-behind as the fallback above.
+      const dayPct     = isExt && ref ? (price - ref) / ref * 100 : q.regularMarketChangePercent;
       return { ...pos, currentPrice: price, mktVal, dayPct, priceTag };
     });
 
     datasets.forEach(({ data, listId, barId }) => {
       if (!data?.positions?.length) return;
       const patched = patchPos(data.positions);
-      renderAccountCards(listId, barId, patched, data.irrRate, data.spyIrrRate, data.spySimRet, data.benchIrrRate, data.benchSimRet);
+      renderAccountCards(listId, barId, patched, data.irrRate, data.spyIrrRate, data.spySimRet, data.benchIrrRate, data.benchSimRet, !!data.hasClosedPositions);
     });
   }
 
@@ -2882,6 +2911,9 @@
             quoteMap[t].postMarketPrice         = ext.postMarketPrice;
             quoteMap[t].postMarketChange        = ext.postMarketChange;
             quoteMap[t].postMarketChangePercent = ext.postMarketChangePercent;
+            // See the matching comment in the Brokerage/IRA/QG&I refresh above -- ported from
+            // desktop commits d2345e7/40276c4/b4485e3 (2026-08-25).
+            quoteMap[t]._freshRef = ext.chartPreviousClose ?? null;
           }
         });
       }
@@ -2995,9 +3027,11 @@
       // total below. Previously these were computed independently from different
       // sources, which is what let them disagree.
       const isExtHours = (q.isPre && q.preMarketPrice != null) || (q.postMarketPrice != null);
-      const ref        = q.regularMarketPrice;
-      const localPct   = isExtHours && ref ? (localPrice - ref) / ref * 100
-                                           : q.regularMarketChangePercent;
+      const ref        = q._freshRef ?? q.regularMarketPrice;
+      // isExt (any non-REGULAR session), not isExtHours -- see the matching comment in the
+      // Brokerage/IRA/QG&I refresh above (ported from desktop commit b4485e3).
+      const localPct   = isExt && ref ? (localPrice - ref) / ref * 100
+                                      : q.regularMarketChangePercent;
       const dayPct     = useSync ? _syncPct : localPct;
 
       // Day change % (top-right, large)
@@ -3102,7 +3136,12 @@
       // single live terminal (Σ current values of positions that have flows), matching desktop
       // computeTabIRRStats. Fall back to the desktop-shipped rate, then the row-based local XIRR.
       let flowsTabRate = null;
-      {
+      // Skip the local pool entirely when desktop has a closed position for this tab -- rows
+      // here only cover currently-held tickers, so pooling them would silently exclude a closed
+      // position's real cash-flow history and understate the rate (2026-08-25, see
+      // _syncedAlphaPicksHasClosed's declaration comment). finalRate below then falls through to
+      // the desktop-shipped rate, which already includes it correctly.
+      if (!_syncedAlphaPicksHasClosed) {
         const pooled = [];
         let term = 0;
         rows.forEach(r => {
