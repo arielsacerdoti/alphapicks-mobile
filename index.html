@@ -2921,15 +2921,23 @@
 
     if (Object.keys(quoteMap).length === 0) {
       // FMP + Yahoo both failed (likely rate-limited). If cards already have
-      // pre-filled prices from the Gist sync, keep showing those silently.
+      // pre-filled prices from the Gist sync, keep showing those silently and
+      // fall through so the stat boxes below still get built from the synced
+      // snapshot (via the pre-seed loop) instead of being left blank — a bare
+      // `return` here used to skip that block entirely, which is why the Alpha
+      // Picks stat boxes went blank far more often than the other tabs: this is
+      // the ONLY tab whose totals depend on a successful LIVE quote fetch,
+      // while Brokerage/IRA/QG&I populate their totals bar from the synced
+      // data immediately in syncFromCloud(), live prices only ever overlaying
+      // on top. Fixed 2026-09-01.
       const hasPrefilled = rows.some(r => r.dataset.currentPrice && parseFloat(r.dataset.currentPrice) > 0);
       if (hasPrefilled) {
         const syncAge = Math.round((Date.now() - (parseInt(document.body.dataset.syncTs || '0') || Date.now())) / 60000);
         setStatus('ok', syncAge > 0 ? `~${syncAge}m ago` : 'Synced');
       } else {
         setStatus('error', 'Price fetch failed — open desktop to sync fresh prices');
+        return;
       }
-      return;
     }
 
     let totalValue = 0, totalDayChange = 0, hasDayChange = false, updatedCount = 0;
@@ -3084,7 +3092,7 @@
       if (prevPrice && price !== prevPrice) flashRow(row, price > prevPrice ? 'up' : 'down');
     });
 
-    if (updatedCount > 0) {
+    if (updatedCount > 0 || totalValue > 0) {
       const TOTAL_COST = rows.reduce((s, r) => s + parseFloat(r.dataset.cost), 0);
       const totalChange = totalValue - TOTAL_COST;
       statTotal.textContent = `$${fmtD(totalValue)}`;
