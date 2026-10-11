@@ -623,7 +623,7 @@
   // Bump on every meaningfully-behavior-changing commit to THIS file (not typo/comment
   // fixes) -- independent of Portfolio.html's own BUILD_VERSION, since the two files are
   // edited and deployed independently and each needs to say when IT was last really changed.
-  const REVISION_DATE = '2026-08-18';
+  const REVISION_DATE = '2026-10-11';
   {
     const el = document.getElementById('revision-date');
     if (el) {
@@ -632,7 +632,16 @@
     }
   }
 
-  const FMP_KEY     = 'RifQbMNRIh92cgRC44u30scmkMK0l0gK';
+  // Per-phone, never in this file: the page is public on GitHub Pages, so any key written here is
+  // public (the old literal key was revoked 2026-10-11). Tap the revision date to set it once on
+  // each phone; it stays in that browser's localStorage. Empty = FMP skipped, Yahoo covers quotes.
+  const FMP_KEY = (() => { try { return localStorage.getItem('fmp_key_local') || ''; } catch { return ''; } })();
+  document.getElementById('revision-date')?.addEventListener('click', () => {
+    const v = prompt('FMP API key for this phone (leave blank to remove):', '');
+    if (v === null) return;
+    try { v.trim() ? localStorage.setItem('fmp_key_local', v.trim()) : localStorage.removeItem('fmp_key_local'); } catch {}
+    location.reload();
+  });
   // GitHub Gist — same values as in AlphaPicks Portfolio.html
   const GIST_USER  = 'arielsacerdoti';
   const GIST_ID    = 'ac2630f3f93387e8c6931ebb27d694a7';
@@ -1673,7 +1682,7 @@
     }
 
     const needLive = allSymbols.filter(s => !earningsMap[s]);
-    if (needLive.length) {
+    if (needLive.length && FMP_KEY) {
       try {
         const url = `https://financialmodelingprep.com/stable/earnings-calendar` +
                     `?from=${fmt(yesterday)}&to=${fmt(tomorrow)}&apikey=${FMP_KEY}`;
@@ -2412,6 +2421,7 @@
   }
 
   async function fetchFMPQuote(symbol) {
+    if (!FMP_KEY) return null;
     try {
       const resp = await fetch(`https://financialmodelingprep.com/stable/quote?symbol=${symbol}&apikey=${FMP_KEY}`, { cache: 'no-store' });
       if (resp.status === 429) return null; // rate-limited — skip silently, Yahoo fallback will cover
