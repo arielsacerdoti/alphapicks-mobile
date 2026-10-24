@@ -636,15 +636,23 @@
   // public (the old literal key was revoked 2026-10-11). Tap the revision date to set it once on
   // each phone; it stays in that browser's localStorage. Empty = FMP skipped, Yahoo covers quotes.
   const FMP_KEY = (() => { try { return localStorage.getItem('fmp_key_local') || ''; } catch { return ''; } })();
+  // Same tap also sets GIST_ID (below). Cancel on either prompt leaves that value untouched.
   document.getElementById('revision-date')?.addEventListener('click', () => {
-    const v = prompt('FMP API key for this phone (leave blank to remove):', '');
-    if (v === null) return;
-    try { v.trim() ? localStorage.setItem('fmp_key_local', v.trim()) : localStorage.removeItem('fmp_key_local'); } catch {}
-    location.reload();
+    const save = (key, v) => {
+      try { v.trim() ? localStorage.setItem(key, v.trim()) : localStorage.removeItem(key); } catch {}
+    };
+    const k = prompt('FMP API key for this phone (blank to remove, Cancel to keep):', '');
+    if (k !== null) save('fmp_key_local', k);
+    const g = prompt('Gist ID for this phone (blank to remove, Cancel to keep):', GIST_ID);
+    if (g !== null) save('gist_id_local', g);
+    if (k !== null || g !== null) location.reload();
   });
   // GitHub Gist — same values as in AlphaPicks Portfolio.html
   const GIST_USER  = 'arielsacerdoti';
-  const GIST_ID    = 'ac2630f3f93387e8c6931ebb27d694a7';
+  // Per-phone too, same as FMP_KEY: a "secret" gist is only unlisted, so anyone holding the ID can
+  // read the holdings — and this page is public. Set it via the revision-date tap above.
+  // Empty = Gist skipped, page falls back to home server / localStorage cache.
+  const GIST_ID = (() => { try { return localStorage.getItem('gist_id_local') || ''; } catch { return ''; } })();
   // No token here, deliberately. This file is copied verbatim to the PUBLIC
   // GitHub Pages repo, and a hardcoded PAT was re-added to git history twice
   // (scrubbed 2026-08-01, blocked again by push protection 2026-08-03).
@@ -1065,7 +1073,7 @@
 
     if (!HOME_MODE) {
       // ── Away: read from GitHub Gist via codetabs CORS proxy ──────────────
-      if (GIST_USER !== 'YOUR_GITHUB_USER' && GIST_ID !== 'YOUR_GIST_ID') {
+      if (GIST_ID) {
         const cb     = Date.now();
         const rawUrl = `https://gist.githubusercontent.com/${GIST_USER}/${GIST_ID}/raw/mobile_data.json`;
         const fetchWithTimeout = (url, ms = 5000, opts = {}) => {
@@ -1109,7 +1117,7 @@
         }
         if (!data) dbg('all Gist attempts failed → cache');
       } else {
-        dbg('GIST_USER/ID not configured');
+        dbg('GIST_ID not set on this phone (tap revision date)');
       }
     }
 
