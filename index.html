@@ -800,7 +800,7 @@
     GM:   '2026-02-17', FN:   '2026-03-02', LITE: '2026-03-16',
     // Brokerage ETFs / other
     SPY:  '2023-09-12', MSFT: '2024-12-04', AIRR: '2024-08-02',
-    NEOS: '2025-09-11', LDQH: '2025-04-14', CRDO: '2026-05-01',
+    NEOS: '2025-09-11', LQDH: '2025-04-14', CRDO: '2026-05-01',  // was 'LDQH' (typo) until 2026-10-29
     // Retirement
     ARCC: '2024-11-08', JAAA: '2024-06-04', BSM:  '2025-03-04',
     DIVO: '2026-02-18', QQQI: '2025-09-11', HGI:  '2022-09-30',
@@ -817,6 +817,9 @@
   // would silently regress desktop's closed-position IRR fix by excluding their history. When
   // true, skip the local pool and defer to _syncedAlphaPicksIrrRate instead (2026-08-25).
   let _syncedAlphaPicksHasClosed  = false;
+  // Net invested of those closed positions -- desktop adds it to the tab's Total Invested (and
+  // takes it off Total Change); mobile only summed its cards, so its totals drifted (2026-10-29).
+  let _syncedAlphaPicksClosedInvested = 0;
 
   // Reconciled per-position cash-flows for Alpha Picks, keyed by ticker — shipped in the sync
   // payload and stashed here by appendPositionCard so the DOM-row-based price loop can compute
@@ -1168,6 +1171,7 @@
     // Render positions (batch — sort once at end). Reset the flows map first so a removed position
     // can't leave a stale entry behind; appendPositionCard repopulates it from each pos.flows.
     _apFlows = {};
+    _syncedAlphaPicksClosedInvested = +data.alphaPicksClosedInvested || 0;  // before syncRows() reads it
     data.activePositions.forEach(pos => appendPositionCard(pos, true));
     mergePositionDuplicates();
     sortPositions();
@@ -1222,10 +1226,11 @@
       _lastQgiData = { positions: qgiCards, irrRate: data.qgiIrrRate ?? null,
         spyIrrRate: data.qgiSpyIrrRate ?? null, spySimRet: data.qgiSpySimpleRet ?? null,
         benchIrrRate: data.qgiBenchIrrRate ?? null, benchSimRet: data.qgiBenchSimpleRet ?? null,
-        hasClosedPositions: !!data.qgiHasClosedPositions };
+        hasClosedPositions: !!data.qgiHasClosedPositions, closedInvested: +data.qgiClosedInvested || 0 };
       renderAccountCards('qgi-list', 'qgi-total-bar', qgiCards,
         data.qgiIrrRate ?? null, data.qgiSpyIrrRate ?? null, data.qgiSpySimpleRet ?? null,
-        data.qgiBenchIrrRate ?? null, data.qgiBenchSimpleRet ?? null, !!data.qgiHasClosedPositions);
+        data.qgiBenchIrrRate ?? null, data.qgiBenchSimpleRet ?? null, !!data.qgiHasClosedPositions,
+        +data.qgiClosedInvested || 0);
     }
     // Render Allocation tab
     if (data.allocation) renderAllocDonuts(data.allocation);
@@ -1253,12 +1258,13 @@
   // trade history, no live shares -- see QGI-1/loadIRRData's virtual rows). Only ever true for
   // qgi today (Brokerage/IRA have no equivalent tagged-list concept). Gates the local pooled
   // recompute below -- see its own comment for why (2026-08-25).
-  function renderAccountCards(listId, totalBarId, positions, tabIrrRate = null, tabSpyIrrRate = null, tabSpySimpleRet = null, tabBenchIrrRate = null, tabBenchSimpleRet = null, hasClosedPositions = false) {
+  function renderAccountCards(listId, totalBarId, positions, tabIrrRate = null, tabSpyIrrRate = null, tabSpySimpleRet = null, tabBenchIrrRate = null, tabBenchSimpleRet = null, hasClosedPositions = false, closedInvested = 0) {
     const list     = document.getElementById(listId);
     const totalBar = document.getElementById(totalBarId);
     if (!list) return;
     list.innerHTML = '';
-    let totalVal = 0, totalCost = 0, totalDayChange = 0, hasDayChange = false;
+    // closedInvested: closed positions' net invested, same credit desktop adds (2026-10-29)
+    let totalVal = 0, totalCost = closedInvested || 0, totalDayChange = 0, hasDayChange = false;
     let totalHgiIncome = 0;
 
     positions.forEach(pos => {
@@ -1752,7 +1758,7 @@
   function syncRows() {
     rows    = Array.from(document.querySelectorAll('#holdings-list .holding-card[data-ticker]'));
     tickers = rows.map(r => r.dataset.ticker);
-    const total = rows.reduce((s, r) => s + parseFloat(r.dataset.cost), 0);
+    const total = rows.reduce((s, r) => s + parseFloat(r.dataset.cost), 0) + _syncedAlphaPicksClosedInvested;
     document.getElementById('stat-total-invested').textContent = `$${fmtD(total)}`;
     syncBellStates();
   }
@@ -2099,10 +2105,21 @@
     row.classList.add(dir === 'up' ? 'flash-up' : 'flash-down');
   }
 
+  // Kept in sync with desktop's calcXIRR (AlphaPicks Portfolio.html) — same analytical
+  // shortcut for the common 2-cashflow case (avoids Newton-Raphson failing to converge on
+  // an extreme short-holding-period rate) and the same deep-loss clamp.
   function calcXIRR(cashFlows, dates) {
-    const MS_PER_DAY = 24 * 3600 * 1000;
+    const MS_PER_DAY  = 24 * 3600 * 1000;
     const d0 = dates[0].getTime();
     const t  = dates.map(d => (d.getTime() - d0) / (365 * MS_PER_DAY));
+
+    // Exact analytical solution for 2-cashflow case (one outflow + one inflow).
+    // Newton-Raphson fails for very short holding periods where the annualised rate
+    // is extreme (e.g. a 3% gain over 13 days annualises to ~1500%).
+    if (cashFlows.length === 2 && cashFlows[0] < 0 && cashFlows[1] > 0 && t[1] > 0) {
+      return Math.pow(cashFlows[1] / Math.abs(cashFlows[0]), 1 / t[1]) - 1;
+    }
+
     function npv(r)  { return cashFlows.reduce((s, cf, i) => s + cf / Math.pow(1 + r, t[i]), 0); }
     function dnpv(r) { return cashFlows.reduce((s, cf, i) => t[i] === 0 ? s : s - t[i] * cf / Math.pow(1 + r, t[i] + 1), 0); }
     for (const guess of [0.1, 0.5, 1.5, 2.0, -0.1]) {
@@ -2110,7 +2127,11 @@
       for (let i = 0; i < 300; i++) {
         const f = npv(r), df = dnpv(r);
         if (!isFinite(f) || Math.abs(df) < 1e-12) break;
-        const nr = r - f / df;
+        let nr = r - f / df;
+        // Clamp: a Newton step landing at r<=-1 makes (1+r) zero/negative, and a fractional
+        // power of that is NaN, which kills convergence before it can find a legitimate
+        // deep-loss rate. Keep the search inside the valid domain instead of aborting.
+        if (nr <= -0.999999) nr = -0.999999;
         if (Math.abs(nr - r) < 1e-8) return nr;
         r = nr;
       }
@@ -2867,7 +2888,7 @@
     datasets.forEach(({ data, listId, barId }) => {
       if (!data?.positions?.length) return;
       const patched = patchPos(data.positions);
-      renderAccountCards(listId, barId, patched, data.irrRate, data.spyIrrRate, data.spySimRet, data.benchIrrRate, data.benchSimRet, !!data.hasClosedPositions);
+      renderAccountCards(listId, barId, patched, data.irrRate, data.spyIrrRate, data.spySimRet, data.benchIrrRate, data.benchSimRet, !!data.hasClosedPositions, data.closedInvested || 0);
     });
   }
 
@@ -3081,19 +3102,33 @@
 
       // Per-position annualised return — prefer EXACT XIRR from the reconciled flows + our own live
       // terminal (value); fall back to CAGR from cost + buy date when no flows were shipped.
+      // A holding period under 1 day makes an *annualized* rate meaningless (and the 1/years
+      // exponent can blow up to an absurd number well before the >1000% HIGH cap even helps
+      // read it) — treated the same way as desktop's per-row "Too new" guard.
       {
         const irrEl = row.querySelector('.irr-val');
         const flowRate = irrFromFlows(_apFlows[row.dataset.ticker], value);
+        const years = row.dataset.date
+          ? (Date.now() - new Date(row.dataset.date).getTime()) / (365.25 * 24 * 3600 * 1000)
+          : null;
+        const tooNew = years !== null && years < 1 / 365;
         let irrPct = null;
-        if (flowRate != null) {
-          irrPct = flowRate * 100;
-        } else if (row.dataset.date && cost > 0 && value > 0) {
-          const years = (Date.now() - new Date(row.dataset.date).getTime()) / (365.25 * 24 * 3600 * 1000);
-          if (years > 1 / 365) irrPct = (Math.pow(value / cost, 1 / years) - 1) * 100;  // at least 1 day old
+        if (!tooNew) {
+          if (flowRate != null) {
+            irrPct = flowRate * 100;
+          } else if (years !== null && cost > 0 && value > 0) {
+            irrPct = (Math.pow(value / cost, 1 / years) - 1) * 100;
+          }
         }
-        if (irrEl && irrPct != null) {
-          irrEl.textContent = irrPct > 1000 ? 'HIGH' : irrPct < -1000 ? 'LOW' : `${irrPct >= 0 ? '+' : ''}${irrPct.toFixed(1)}%`;
-          irrEl.style.color = irrPct >= 10 ? '#3fb950' : irrPct >= 5 ? '#e3b341' : '#ff7b72';
+        if (irrEl) {
+          if (tooNew) {
+            irrEl.textContent = 'Too new';
+            irrEl.style.color = '#8b949e';
+            irrEl.title = 'Bought less than a day ago — an annualized rate would be meaningless this early';
+          } else if (irrPct != null) {
+            irrEl.textContent = irrPct > 1000 ? 'HIGH' : irrPct < -1000 ? 'LOW' : `${irrPct >= 0 ? '+' : ''}${irrPct.toFixed(1)}%`;
+            irrEl.style.color = irrPct >= 10 ? '#3fb950' : irrPct >= 5 ? '#e3b341' : '#ff7b72';
+          }
         }
       }
 
@@ -3111,7 +3146,7 @@
     });
 
     if (updatedCount > 0 || totalValue > 0) {
-      const TOTAL_COST = rows.reduce((s, r) => s + parseFloat(r.dataset.cost), 0);
+      const TOTAL_COST = rows.reduce((s, r) => s + parseFloat(r.dataset.cost), 0) + _syncedAlphaPicksClosedInvested;
       const totalChange = totalValue - TOTAL_COST;
       statTotal.textContent = `$${fmtD(totalValue)}`;
 
