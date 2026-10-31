@@ -1155,12 +1155,13 @@
 
     updateModeBadge(source);
 
-    // Clear existing cards and re-render
-    // Only wipe if we have fresh data — never leave the user with a blank screen
+    // Clear existing cards and re-render -- for EVERY source, cache included. `data` always
+    // holds the full position list, so this never blanks the screen. Wiping only for
+    // local/cloud let a 'cache' sync append a second set of cards, which
+    // mergePositionDuplicates then summed (shares + cost), compounding 1x -> 2x -> 3x -> 4x
+    // across cache syncs: the 2026-10-30 "$1,104,418 current value" header (2026-10-31).
     const list = document.getElementById('holdings-list');
-    if (source === 'local' || source === 'cloud') {
-      list.querySelectorAll('.holding-card').forEach(c => c.remove());
-    }
+    list.querySelectorAll('.holding-card').forEach(c => c.remove());
 
     // Apply localStorage from synced data
     localStorage.setItem('alphapicks_sold_rows',  JSON.stringify(data.soldRows || []));
@@ -1172,8 +1173,8 @@
     // can't leave a stale entry behind; appendPositionCard repopulates it from each pos.flows.
     _apFlows = {};
     _syncedAlphaPicksClosedInvested = +data.alphaPicksClosedInvested || 0;  // before syncRows() reads it
-    data.activePositions.forEach(pos => appendPositionCard(pos, true));
-    mergePositionDuplicates();
+    const newCards = data.activePositions.map(pos => appendPositionCard(pos, true));
+    mergePositionDuplicates(newCards);
     sortPositions();
 
     // Render sold rows
@@ -2052,11 +2053,14 @@
     }
 
     if (!skipSort) sortPositions();
+    return card;
   }
 
-  function mergePositionDuplicates() {
-    const list    = document.getElementById('holdings-list');
-    const allCards = Array.from(list.querySelectorAll('.holding-card[data-ticker]'));
+  // Merges same-ticker lots among `cards` only -- the cards just rendered from one
+  // data.activePositions list -- never against cards left in the DOM by an earlier render,
+  // which would sum a position with its own previous copy (the 4x header, 2026-10-31).
+  function mergePositionDuplicates(cards) {
+    const allCards = (cards || []).filter(c => c && c.isConnected && c.dataset.ticker);
     const byTicker = {};
     allCards.forEach(c => { const t = c.dataset.ticker; (byTicker[t] = byTicker[t] || []).push(c); });
     Object.values(byTicker).forEach(group => {
@@ -2213,6 +2217,7 @@
     return {
       state, isPre, isPost,
       regularMarketPrice:         q.regularMarketPrice,
+      regularMarketPreviousClose: prev,  // POST/CLOSED day-% reference, as on desktop (2026-10-31)
       regularMarketChange:        prev ? q.regularMarketPrice - prev : null,
       regularMarketChangePercent: prev ? ((q.regularMarketPrice - prev) / prev) * 100 : null,
       preMarketPrice:  prePrice,
@@ -2332,11 +2337,12 @@
     // During PRE, scan the candles for yesterday's actual regular close instead,
     // and return null rather than falling back — a missing reference costs a
     // change percentage, a wrong one corrupts the price itself.
-    // POST is unaffected: the chart starts at today's open there, so the field
-    // genuinely is yesterday.
+    // POST/CLOSED: null, NOT meta.chartPreviousClose -- on this range=5d chart that field is the
+    // close FIVE sessions back, so day % in POST/CLOSED was measured against last week
+    // (2026-10-31, same fix as desktop). Callers fall back to regularMarketPreviousClose.
     const prev = (state === 'PRE' && preStartMs > 0)
       ? lastCloseInPeriod(preStartMs - 14 * 3600000, preStartMs - 11.5 * 3600000)
-      : (meta.chartPreviousClose ?? meta.previousClose);
+      : null;
     let pre = null, preChg = null, prePct = null;
     let post = null, postChg = null, postPct = null;
     if (state === 'PRE') {
@@ -2876,7 +2882,9 @@
       if (!price) return pos;
       const mktVal = price * (pos.shares || 0);
       const isExtHours = (q.isPre && q.preMarketPrice != null) || (q.postMarketPrice != null);
-      const ref        = q._freshRef ?? q.regularMarketPrice;
+      // After-hours price vs the PREVIOUS close (the whole day plus AH), as desktop's fetchPrices
+      // does; _freshRef is now only set in PRE (2026-10-31).
+      const ref        = q._freshRef ?? (q.postMarketPrice != null ? (q.regularMarketPreviousClose ?? q.regularMarketPrice) : q.regularMarketPrice);
       // Gated on isExt (any non-REGULAR session), not isExtHours (a confirmed real tick) --
       // ported from desktop commit b4485e3: a ticker with NO genuine extended print at all
       // used to fall all the way through to q.regularMarketChangePercent, the raw provider's
@@ -3074,7 +3082,9 @@
       // total below. Previously these were computed independently from different
       // sources, which is what let them disagree.
       const isExtHours = (q.isPre && q.preMarketPrice != null) || (q.postMarketPrice != null);
-      const ref        = q._freshRef ?? q.regularMarketPrice;
+      // After-hours price vs the PREVIOUS close (the whole day plus AH), as desktop's fetchPrices
+      // does; _freshRef is now only set in PRE (2026-10-31).
+      const ref        = q._freshRef ?? (q.postMarketPrice != null ? (q.regularMarketPreviousClose ?? q.regularMarketPrice) : q.regularMarketPrice);
       // isExt (any non-REGULAR session), not isExtHours -- see the matching comment in the
       // Brokerage/IRA/QG&I refresh above (ported from desktop commit b4485e3).
       const localPct   = isExt && ref ? (localPrice - ref) / ref * 100
@@ -3160,7 +3170,7 @@
         elPct.textContent = `${dcUp ? '+' : ''}${dcPct.toFixed(2)}%`;
         elPct.style.color = dcUp ? '#3fb950' : '#ff7b72';
       }
-      statGain.textContent = `${totalChange >= 0 ? '+' : ''}$${fmtD(Math.abs(totalChange))}`;
+      statGain.textContent = `${totalChange >= 0 ? '+' : '-'}$${fmtD(Math.abs(totalChange))}`;  // '-' was missing: a loss showed unsigned (2026-10-31)
       statGain.className   = `stat-value ${totalChange >= 0 ? 'green' : 'red'}`;
       const pctChange = (totalChange / TOTAL_COST) * 100;
       statPctChange.textContent = `${pctChange >= 0 ? '+' : ''}${pctChange.toFixed(2)}%`;
@@ -3276,6 +3286,9 @@
   // ── Price cache ───────────────────────────────────────────────────────────
   function savePriceCache() {
     try {
+      // Never persist an inflated render (same ticker twice) -- see restoreFromPriceCache.
+      const _tks = rows.map(r => r.dataset.ticker);
+      if (new Set(_tks).size !== _tks.length) { localStorage.removeItem('mobile_price_cache'); return; }
       const cardData = rows.map(r => ({
         ticker:      r.dataset.ticker,
         priceHTML:   r.querySelector('.cur-price')?.innerHTML   ?? '',
@@ -3317,6 +3330,19 @@
                     :                         20 * 60 * 1000;
       if (age > maxAge) return false;
 
+      // A cache holding the same ticker twice was saved from an inflated render (the 4x
+      // header, 2026-10-31) -- its card list AND its header totals are both wrong, so drop
+      // the whole cache rather than paint it and wait for the next refresh to correct it.
+      if (cache.listHTML) {
+        const probe = document.createElement('div');
+        probe.innerHTML = cache.listHTML;
+        const tks = Array.from(probe.querySelectorAll('.holding-card[data-ticker]')).map(c => c.dataset.ticker);
+        if (new Set(tks).size !== tks.length) {
+          localStorage.removeItem('mobile_price_cache');
+          return false;
+        }
+      }
+
       // M1: restore card HTML first so syncRows() can populate tickers immediately
       if (cache.listHTML) {
         const listEl = document.getElementById('holdings-list');
@@ -3339,10 +3365,23 @@
         if (ic && c.irrText)     { ic.textContent = c.irrText; if (c.irrColor) ic.style.color = c.irrColor; }
         if (wc && c.weight)      wc.textContent  = c.weight;
       });
-      Object.entries(cache.stats || {}).forEach(([id, s]) => {
-        const el = document.getElementById(id);
-        if (el) { el.textContent = s.text; el.className = s.cls; if (s.color) el.style.color = s.color; }
-      });
+      // Header boxes are restored together or not at all, and only when they agree with each
+      // other (value - invested = total change). Restoring them piecemeal is how a correct
+      // Total Invested sat next to a 4x Current Value on 2026-10-30 (2026-10-31).
+      const st = cache.stats || {};
+      const num = id => {
+        const v = parseFloat((st[id]?.text || '').replace(/[^0-9.]/g, ''));
+        return /-/.test(st[id]?.text || '') || /\bred\b/.test(st[id]?.cls || '') ? -v : v;
+      };
+      const HEADER_IDS = ['stat-total-value', 'stat-total-invested', 'stat-total-gain'];
+      const statsOk = HEADER_IDS.every(id => isFinite(num(id)))
+        && Math.abs(num('stat-total-value') - num('stat-total-invested') - num('stat-total-gain')) <= 2;
+      if (statsOk) {
+        Object.entries(st).forEach(([id, s]) => {
+          const el = document.getElementById(id);
+          if (el) { el.textContent = s.text; el.className = s.cls; if (s.color) el.style.color = s.color; }
+        });
+      }
 
       const mins = Math.max(0, Math.round(age / 60000));
       setStatus('ok', `Prices ${mins < 1 ? '<1' : mins}m old`);
