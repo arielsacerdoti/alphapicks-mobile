@@ -625,10 +625,24 @@
   // edited and deployed independently and each needs to say when IT was last really changed.
   const REVISION_DATE = '2026-10-31';
   {
+    // 2026-10-31: show the NEWER of REVISION_DATE and the page's real Last-Modified (GitHub
+    // Pages sets it at each deploy; the home server's /mobile sends the file's mtime), so a
+    // forgotten bump can't leave a stale date. A value within a minute of load means no header
+    // was sent (the browser then reports "now") and is ignored -- see desktop BUILD_VERSION.
+    const lm   = new Date(document.lastModified);
+    const lmOk = !isNaN(lm) && Math.abs(Date.now() - lm.getTime()) > 60000;
+    const stamped = new Date(REVISION_DATE + 'T12:00:00');
+    const shown = lmOk && lm > stamped ? lm : stamped;
     const el = document.getElementById('revision-date');
     if (el) {
-      el.textContent = new Date(REVISION_DATE + 'T12:00:00')
-        .toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+      el.textContent = shown.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+      el.title = 'Tap to set FMP key, Gist ID and Gist passphrase';
+      // At home (or over Tailscale) the snapshot comes from /mobile-data in plaintext, so the
+      // passphrase prompt only appears once the page has to read the Gist. Make the tap
+      // discoverable until the passphrase is stored.
+      let hasPass = false;
+      try { hasPass = !!localStorage.getItem('gist_passphrase_local'); } catch {}
+      if (!hasPass) el.textContent += ' · 🔑 tap to set passphrase';
     }
   }
 
