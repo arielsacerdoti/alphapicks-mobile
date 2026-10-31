@@ -623,7 +623,7 @@
   // Bump on every meaningfully-behavior-changing commit to THIS file (not typo/comment
   // fixes) -- independent of Portfolio.html's own BUILD_VERSION, since the two files are
   // edited and deployed independently and each needs to say when IT was last really changed.
-  const REVISION_DATE = '2026-10-11';
+  const REVISION_DATE = '2026-10-31';
   {
     const el = document.getElementById('revision-date');
     if (el) {
@@ -645,7 +645,9 @@
     if (k !== null) save('fmp_key_local', k);
     const g = prompt('Gist ID for this phone (blank to remove, Cancel to keep):', GIST_ID);
     if (g !== null) save('gist_id_local', g);
-    if (k !== null || g !== null) location.reload();
+    const p = prompt('Gist passphrase for this phone (blank to remove, Cancel to keep):', '');
+    if (p !== null) save(GIST_PASS_KEY, p);
+    if (k !== null || g !== null || p !== null) location.reload();
   });
   // GitHub Gist — same values as in AlphaPicks Portfolio.html
   const GIST_USER  = 'arielsacerdoti';
@@ -1015,11 +1017,69 @@
   // purpose. The desktop app is the sole owner of the log/Excel file; mobile only ever reads.
 
 
+  // ── Encrypted Gist snapshot (2026-10-31) ─────────────────────────────────
+  // The Gist is readable by anyone holding its URL, so the desktop and the server now push
+  // {"v":1,"alg":"AES-GCM","kdf":"PBKDF2-SHA256","iter":310000,"salt","iv","ct"} instead of the
+  // plain snapshot (same format as Schwab/gist_crypto.js). The passphrase lives in the desktop's
+  // schwab_secrets.js; this phone asks for it once and keeps it in localStorage. A plaintext Gist
+  // (older pushes) is still accepted. Home /mobile-data stays plaintext on the LAN.
+  const GIST_PASS_KEY = 'gist_passphrase_local';
+  let _gistPassDeclined = false;   // Cancel on the prompt: don't ask again until reload
+  let _gistLockMsg      = '';      // set when an envelope could not be opened; shown in the badge
+  const isGistEnvelope = j => !!j && j.v === 1 && j.alg === 'AES-GCM' && typeof j.ct === 'string';
+
+  async function decryptGistEnvelope(env, pass) {
+    const b64  = str => Uint8Array.from(atob(str), c => c.charCodeAt(0));
+    const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
+    const key  = await crypto.subtle.deriveKey(
+      { name: 'PBKDF2', hash: 'SHA-256', salt: b64(env.salt), iterations: env.iter },
+      base, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64(env.iv) }, key, b64(env.ct));
+    return JSON.parse(new TextDecoder().decode(pt));
+  }
+
+  // Returns the snapshot, or throws with a message meant for the screen. AES-GCM authenticates,
+  // so a wrong passphrase always fails here -- it can never decode into wrong numbers.
+  async function openGistSnapshot(json) {
+    if (!isGistEnvelope(json)) return json;
+    if (json.kdf !== 'PBKDF2-SHA256') throw new Error('Unknown snapshot encryption — update this page');
+    if (!window.crypto?.subtle) throw new Error('Encrypted snapshot needs the https page (GitHub Pages)');
+    let pass  = (() => { try { return localStorage.getItem(GIST_PASS_KEY) || ''; } catch { return ''; } })();
+    let wrong = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (!pass) {
+        if (_gistPassDeclined) break;
+        pass = prompt(wrong
+          ? 'Wrong passphrase — the snapshot could not be decrypted. Try again:'
+          : 'The cloud snapshot is encrypted. Enter the Gist passphrase (GIST_PASSPHRASE in schwab_secrets.js on the desktop):', '');
+        if (pass === null) { _gistPassDeclined = true; break; }
+        pass = pass.trim();
+        if (!pass) continue;
+      }
+      try {
+        const data = await decryptGistEnvelope(json, pass);
+        try { localStorage.setItem(GIST_PASS_KEY, pass); } catch {}
+        _gistLockMsg = '';
+        return data;
+      } catch {
+        try { localStorage.removeItem(GIST_PASS_KEY); } catch {}
+        wrong = true;
+        pass  = '';
+      }
+    }
+    throw new Error(wrong ? 'Wrong Gist passphrase — tap the revision date to re-enter it'
+                          : 'Cloud snapshot is encrypted — tap the revision date to enter the passphrase');
+  }
+
   // ── Sync: HOME (local server) or AWAY (JSONBin / cache) ──────────────────
   function updateModeBadge(source) {
     const badge = document.getElementById('mode-badge');
     if (!badge) return;
-    if (source === 'local') {
+    if (_gistLockMsg && source !== 'local' && source !== 'cloud') {
+      badge.textContent = '🔒 Locked · cached';
+      badge.title       = _gistLockMsg;
+      badge.className   = 'mode-badge away';
+    } else if (source === 'local') {
       badge.textContent = '🏠 Home';
       badge.className   = 'mode-badge home';
     } else if (source === 'cloud') {
@@ -1107,7 +1167,15 @@
             dbg(`Gist via ${label}…`);
             const resp = await fn();
             dbg(`${label} ok`);
-            const json = resp._json ?? await resp.json();
+            const raw  = resp._json ?? await resp.json();
+            let json;
+            try { json = await openGistSnapshot(raw); }
+            catch (e) {
+              // Every source returns the same envelope, so trying the others can't help.
+              _gistLockMsg = e.message;
+              dbg(`${label} decrypt: ${e.message}`);
+              break;
+            }
             dbg(`${label} parsed, pos=${json?.activePositions?.length ?? 'none'}`);
             if (json?.activePositions?.length) {
               data   = json;
@@ -1141,7 +1209,8 @@
     if (!data?.activePositions?.length) {
       dbg('no data — showing placeholder');
       if (ph) {
-        ph.textContent = 'No data yet — open the desktop app at home and let it refresh once to cache your positions.';
+        ph.textContent = _gistLockMsg
+          || 'No data yet — open the desktop app at home and let it refresh once to cache your positions.';
       }
       return false;
     }
